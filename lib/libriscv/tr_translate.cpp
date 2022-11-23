@@ -137,6 +137,69 @@ int CPU<W>::load_translation(const MachineOptions<W>& options,
 }
 
 template <int W>
+struct CodeBlock {
+	using address_t = address_type<W>;
+
+	TransInstr<W>& instr;
+	size_t      length;
+	address_t   vaddr;
+	address_t   vaddr_end;
+	bool        has_branch;
+	std::set<address_t> jump_locations;
+};
+
+// Measure length of instructions that belong
+// together sequentially (a code block).
+template <int W, typename T>
+static CodeBlock<W> find_block(address_type<W> basepc, T it, T end_it)
+{
+	const auto block = it;
+	bool has_branch = false;
+	auto current_pc = basepc;
+	std::set<address_type<W>> jump_locations;
+
+	for (; it != end_it; ++it)
+	{
+		const rv32i_instruction instruction{it->instr};
+		const auto opcode = instruction.opcode();
+
+		// JALR is a show-stopper / code-blocker
+		if (opcode == RV32I_JALR)
+		{
+			current_pc += 4;
+			++it;
+			break;
+		}
+		// loop detection (negative branch offsets)
+		if (opcode == RV32I_BRANCH)
+		{
+			has_branch = true;
+			// detect jump location
+			const auto offset = instruction.Btype.signed_imm();
+			jump_locations.insert(current_pc + offset);
+		}
+		if (opcode == RV32I_JAL)
+		{
+			has_branch = true;
+			const auto offset = instruction.Jtype.jump_offset();
+			jump_locations.insert(current_pc + offset);
+		}
+
+		current_pc += 4;
+	} // find block
+
+	const size_t length = it - block;
+
+	return CodeBlock<W>{
+		*block,
+		length,
+		basepc,
+		current_pc,
+		has_branch,
+		std::move(jump_locations)};
+}
+
+template <int W>
 void CPU<W>::try_translate(const MachineOptions<W>& options,
 	const std::string& filename, address_t basepc, std::vector<TransInstr<W>> ipairs) const
 {
@@ -176,70 +239,29 @@ if constexpr (SCAN_FOR_GP) {
 	TIME_POINT(t2);
 	size_t icounter = 0;
 	auto it = ipairs.begin();
-	std::vector<std::pair<decltype(it), address_t>> loops;
-	struct CodeBlock {
-		TransInstr<W>& instr;
-		size_t      length;
-		address_t   addr;
-		bool        has_branch;
-		std::set<address_t> jump_locations;
-	};
-	std::vector<CodeBlock> blocks;
-	std::set<address_t> jump_locations;
+	std::vector<CodeBlock<W>> blocks;
 
 	while (it != ipairs.end() && icounter < options.translate_instr_max)
 	{
-		const auto block = it;
-		bool has_branch = false;
-		// Measure length of instructions that belong
-		// together sequentially (a code block).
-		auto current_pc = basepc;
-
-		for (; it != ipairs.end(); ++it) {
-			const rv32i_instruction instruction{it->instr};
-			const auto opcode = instruction.opcode();
-
-			// JALR is a show-stopper / code-blocker
-			if (opcode == RV32I_JALR)
-			{
-				current_pc += 4;
-				++it; break;
-			}
-			// loop detection (negative branch offsets)
-			if (opcode == RV32I_BRANCH) {
-				has_branch = true;
-				// detect jump location
-				const auto offset = instruction.Btype.signed_imm();
-				jump_locations.insert(current_pc + offset);
-			}
-			if (opcode == RV32I_JAL) {
-				has_branch = true;
-				const auto offset = instruction.Jtype.jump_offset();
-				jump_locations.insert(current_pc + offset);
-			}
-
-			current_pc += 4;
-		} // find block
+		const auto block = find_block<W>(basepc, it, ipairs.end());
 
 		// Process block and add it for emission
-		const size_t length = it - block;
-		if (length >= options.block_size_treshold
-			&& icounter + length < options.translate_instr_max)
+		if (block.length >= options.block_size_treshold
+			&& icounter + block.length < options.translate_instr_max)
 		{
 			if constexpr (VERBOSE_BLOCKS) {
-				printf("Block found at %#lX. Length: %zu\n", (long) basepc, length);
+				printf("Block found at %#lX. Length: %zu\n", (long)basepc, block.length);
 			}
-			blocks.push_back({
-				*block, length, basepc, has_branch,
-				std::move(jump_locations)
-			});
-			icounter += length;
+			blocks.push_back(std::move(block));
+			// measure/limit translated instruction count
+			icounter += block.length;
 			// we can't translate beyond this estimate, otherwise
 			// the compiler will never finish code generation
-			if (blocks.size() >= options.translate_blocks_max)
+			if (UNLIKELY(blocks.size() >= options.translate_blocks_max))
 				break;
 		}
-		basepc = current_pc;
+
+		basepc = block.vaddr_end;
 	}
 #ifdef BINTR_TIMING
 	TIME_POINT(t3);
@@ -254,14 +276,14 @@ if constexpr (SCAN_FOR_GP) {
 	for (const auto& block : blocks)
 	{
 		std::string func =
-			"f" + std::to_string(block.addr);
+			"f" + std::to_string(block.vaddr);
 		emit(code, func, &block.instr, {
-			block.addr, gp, (int)block.length,
+			block.vaddr, gp, (int)block.length,
 			block.has_branch,
 			true, // forward jumps
 			std::move(block.jump_locations)
 		});
-		dlmappings.push_back({block.addr, std::move(func)});
+		dlmappings.push_back({block.vaddr, std::move(func)});
 	}
 	// Append all instruction handler -> dl function mappings
 	code += "const uint32_t no_mappings = "

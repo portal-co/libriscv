@@ -10,7 +10,7 @@
 #define ILLEGAL_AND_EXIT() { code += "api.exception(cpu, ILLEGAL_OPCODE);\nreturn;\n"; }
 
 namespace riscv {
-static constexpr int LOOP_INSTRUCTIONS_MAX = 4096;
+static constexpr int LOOP_INSTRUCTIONS_MAX = 24'000;
 
 template <typename ... Args>
 inline void add_code(std::string& code, Args&& ... addendum) {
