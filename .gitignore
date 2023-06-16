@@ -13,3 +13,4 @@ webapi/tests/binary
 .vscode/
 gmon.out
 callgraph.svg
+bazel-*
