@@ -1,6 +1,7 @@
 #pragma once
 #include <type_traits>
 #include <string>
+#include <string_view>
 #include "util/function.hpp"
 #include "types.hpp"
 
@@ -27,6 +28,12 @@ namespace riscv
 	static constexpr bool memory_traps_enabled = true;
 #else
 	static constexpr bool memory_traps_enabled = false;
+#endif
+
+#ifdef RISCV_FORCE_ALIGN_MEMORY
+	static constexpr bool force_align_memory = true;
+#else
+	static constexpr bool force_align_memory = false;
 #endif
 
 #ifdef RISCV_DEBUG
@@ -87,13 +94,15 @@ namespace riscv
 		bool minimal_fork = false;
 		// Allow the use of a linear arena to increase memory locality somewhat
 		bool use_memory_arena = memory_arena_is_default;
+		// Override exit function with a program-provided function
+		std::string_view default_exit_function;
 
 		riscv::Function<struct Page&(Memory<W>&, address_type<W>, bool)> page_fault_handler = nullptr;
 
 #ifdef RISCV_BINARY_TRANSLATION
 		unsigned block_size_treshold = 6;
 		unsigned translate_blocks_max = 5000;
-		unsigned translate_instr_max = 128'000;
+		unsigned translate_instr_max = 150'000;
 #endif
 	};
 

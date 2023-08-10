@@ -2,7 +2,7 @@
 #include "instruction_list.hpp"
 #include "rv32i_instr.hpp"
 #include "rvfd.hpp"
-#include <set>
+#include "tr_types.hpp"
 
 #define PCRELA(x) ((address_t) (tinfo.basepc + i * 4 + (x)))
 #define PCRELS(x) std::to_string(PCRELA(x)) + "UL"
@@ -10,7 +10,7 @@
 #define ILLEGAL_AND_EXIT() { code += "api.exception(cpu, ILLEGAL_OPCODE);\nreturn;\n"; }
 
 namespace riscv {
-static constexpr int LOOP_INSTRUCTIONS_MAX = 4096;
+static const std::string LOOP_EXPRESSION = "c < local_max_insn";
 
 template <typename ... Args>
 inline void add_code(std::string& code, Args&& ... addendum) {
@@ -40,7 +40,7 @@ inline std::string from_imm(int64_t imm) {
 struct BranchInfo {
 	bool sign;
 	bool goto_enabled;
-	int jump_label;
+	int jump_label; // destination index, 0 when unused
 };
 #define FUNCLABEL(i)  (func + "_" + std::to_string(i))
 template <int W>
@@ -53,18 +53,25 @@ inline void add_branch(std::string& code, const BranchInfo& binfo, const std::st
 		code += "if ((saddr_t)" + from_reg(tinfo, instr.Btype.rs1) + op + " (saddr_t)" + from_reg(tinfo, instr.Btype.rs2) + ") {\n";
 	if (binfo.goto_enabled) {
 		// this is a jump back to the start of the function
-		code += "c += " + std::to_string(i) + "; if (c < " + std::to_string(LOOP_INSTRUCTIONS_MAX) + ") goto " + func + "_start;\n";
-		// We can simplify this jump because we know it's safe
-		// This side of the branch exits bintr because of max instructions reached
-		code += "cpu->pc = " + PCRELS(instr.Btype.signed_imm() - 4) + ";\n"
-			"return;}\n";
+		code += "c += " + std::to_string(i) + "; if (" + LOOP_EXPRESSION + ") goto " + func + "_start;\n";
 	} else if (binfo.jump_label > 0) {
-		code += "goto " + FUNCLABEL(binfo.jump_label) + ";\n"
-				"}\n";
-	} else {
-	// The number of instructions to increment depends on if branch-instruction-counting is enabled
-	code += "api.jump(cpu, " + PCRELS(instr.Btype.signed_imm() - 4) + ", " + (tinfo.has_branch ? "c" : std::to_string(i)) + ");\n"
-		"return;}\n";
+		// forward jump to label (from absolute index)
+		code += "c += " + std::to_string(i) + "; if (" + LOOP_EXPRESSION + ") ";
+		code += "goto " + FUNCLABEL(binfo.jump_label) + ";\n";
+		// else, exit binary translation
+	}
+	if (PCRELA(instr.Btype.signed_imm()) & 0x3)
+	{
+		code +=
+			"api.exception(cpu, " + std::to_string(MISALIGNED_INSTRUCTION) + ");\n";
+	}
+	else
+	{
+		// The number of instructions to increment depends on if branch-instruction-counting is enabled
+		code += 
+			"*cur_insn = c; "
+			"cpu->pc = " + PCRELS(instr.Btype.signed_imm() - 4) + ";\n"
+			"return;}\n";
 	}
 }
 template <int W>
@@ -88,7 +95,7 @@ void CPU<W>::emit(std::string& code, const std::string& func, TransInstr<W>* ip,
 	static const std::string SIGNEXTW = "(saddr_t) (int32_t)";
 	std::set<unsigned> labels;
 	code += "extern void " + func + "(CPU* cpu) {\n"
-		"int c = 0; " + func + "_start:;\n";
+		"uint64_t c = *cur_insn, local_max_insn = *max_insn; " + func + "_start:;\n";
 
 	for (int i = 0; i < tinfo.len; i++) {
 		const auto instr = rv32i_instruction {ip[i].instr};
@@ -188,9 +195,11 @@ void CPU<W>::emit(std::string& code, const std::string& func, TransInstr<W>* ip,
 			// forward label: branch inside code block
 			int fl = 0;
 			if (offset > 0 && i+offset < tinfo.len) {
+				// forward label: future address
 				fl = i+offset;
 				labels.insert(fl);
 			} else if (tinfo.jump_locations.count(PCRELA(offset * 4))) {
+				// forward label: existing jump location
 				const int dstidx = i + offset;
 				if (dstidx > 0 && dstidx < tinfo.len) {
 					fl = dstidx;
@@ -223,12 +232,13 @@ void CPU<W>::emit(std::string& code, const std::string& func, TransInstr<W>* ip,
 		case RV32I_JALR: {
 			// jump to register + immediate
 			// NOTE: We need to remember RS1 because it can be clobbered by RD
-			add_code(code, "addr_t jrs1 = " + from_reg(tinfo, instr.Itype.rs1) + ";");
+			add_code(code, "{addr_t jrs1 = " + from_reg(tinfo, instr.Itype.rs1) + ";");
 			if (instr.Itype.rd != 0) {
 				add_code(code, from_reg(instr.Itype.rd) + " = " + PCRELS(4) + ";");
 			}
-			add_code(code, "api.jump(cpu, jrs1 + "
-				+ from_imm(instr.Itype.signed_imm()) + " - 4, " + INSTRUCTION_COUNT(i) + ");",
+			add_code(code, 
+				"*cur_insn = c + " + std::to_string(i) + ";\n"
+				"api.jump(cpu, jrs1 + " + from_imm(instr.Itype.signed_imm()) + " - 4); }",
 				"}");
 			} return;
 		case RV32I_JAL: {
@@ -243,15 +253,17 @@ void CPU<W>::emit(std::string& code, const std::string& func, TransInstr<W>* ip,
 				if (fl > i)
 					labels.insert(fl);
 				// this is a jump back to the start of the function
-				add_code(code, "c += " + std::to_string(i) + "; if (c < " + std::to_string(LOOP_INSTRUCTIONS_MAX) + ") goto " + FUNCLABEL(fl) + ";");
+				add_code(code, "c += " + std::to_string(i) + "; if (" + LOOP_EXPRESSION + ") goto " + FUNCLABEL(fl) + ";");
 				// if we run out of instructions, we must exit:
 				add_code(code,
-					"api.jump(cpu, " + PCRELS(instr.Jtype.jump_offset() - 4) + ", " + INSTRUCTION_COUNT(i) + ");",
+					"*cur_insn = c;\n"
+					"api.jump(cpu, " + PCRELS(instr.Jtype.jump_offset() - 4) + ");\n"
 					"return;");
 			} else {
 				// Because of forward jumps we can't end the function here
 				add_code(code,
-					"api.jump(cpu, " + PCRELS(instr.Jtype.jump_offset() - 4) + ", " + INSTRUCTION_COUNT(i) + ");",
+					"*cur_insn = c + " + std::to_string(i) + ";\n"
+					"api.jump(cpu, " + PCRELS(instr.Jtype.jump_offset() - 4) + ");\n"
 					"return;");
 			} } break;
 		case RV32I_OP_IMM: {
@@ -268,8 +280,19 @@ void CPU<W>::emit(std::string& code, const std::string& func, TransInstr<W>* ip,
 				} break;
 			case 0x1: // SLLI
 				// SLLI: Logical left-shift 5/6-bit immediate
-				emit_op(code, " << ", " <<= ", tinfo, instr.Itype.rd, instr.Itype.rs1,
-					std::to_string(instr.Itype.shift64_imm() & (XLEN-1)));
+				switch (instr.Itype.imm) {
+				case 0b011000000100: // SEXT.B
+					add_code(code,
+						dst + " = (saddr_t)(int8_t)" + src + ";");
+					break;
+				case 0b011000000101: // SEXT.H
+					add_code(code,
+						dst + " = (saddr_t)(int16_t)" + src + ";");
+					break;
+				default:
+					emit_op(code, " << ", " <<= ", tinfo, instr.Itype.rd, instr.Itype.rs1,
+						std::to_string(instr.Itype.shift64_imm() & (XLEN-1)));
+				}
 				break;
 			case 0x2: // SLTI:
 				// signed less than immediate
@@ -287,6 +310,12 @@ void CPU<W>::emit(std::string& code, const std::string& func, TransInstr<W>* ip,
 				if (LIKELY(!instr.Itype.is_srai())) {
 					emit_op(code, " >> ", " >>= ", tinfo, instr.Itype.rd, instr.Itype.rs1,
 						std::to_string(instr.Itype.shift64_imm() & (XLEN-1)));
+				} else if (instr.Itype.is_rori()) {
+					// RORI: Rotate right immediate
+					add_code(code,
+					"{const unsigned shift = " + from_imm(instr.Itype.imm & (XLEN-1)) + ";\n",
+						dst + " = (" + src + " >> shift) | (" + src + " << (XLEN - shift)); }"
+					);
 				} else { // SRAI: preserve the sign bit
 					add_code(code,
 						dst + " = (saddr_t)" + src + " >> (" + from_imm(instr.Itype.signed_imm()) + " & (XLEN-1));");
@@ -325,11 +354,26 @@ void CPU<W>::emit(std::string& code, const std::string& func, TransInstr<W>* ip,
 					from_reg(instr.Rtype.rd) + " = (" + from_reg(tinfo, instr.Rtype.rs1) + " < " + from_reg(tinfo, instr.Rtype.rs2) + ") ? 1 : 0;");
 				break;
 			case 0x4: // XOR
-				emit_op(code, " ^ ", " ^= ", tinfo, instr.Rtype.rd, instr.Rtype.rs1, from_reg(instr.Rtype.rs2));
+				if (instr.Rtype.funct7 == 0x0) {
+					emit_op(code, " ^ ", " ^= ", tinfo, instr.Rtype.rd, instr.Rtype.rs1, from_reg(instr.Rtype.rs2));
+				} else if (instr.Rtype.funct7 == 0x4) {
+					// Mask off bits to 16-bit
+					add_code(code,
+						from_reg(instr.Rtype.rd) + " = uint16_t(" + from_reg(tinfo, instr.Rtype.rs1) + ");");
+				}
 				break;
-			case 0x5: // SRL
-				add_code(code,
-					from_reg(instr.Rtype.rd) + " = " + from_reg(tinfo, instr.Rtype.rs1) + " >> (" + from_reg(tinfo, instr.Rtype.rs2) + " & (XLEN-1));");
+			case 0x5: // SRL / ROR
+				if (instr.Itype.high_bits() == 0x0) {
+					add_code(code,
+						from_reg(instr.Rtype.rd) + " = " + from_reg(tinfo, instr.Rtype.rs1) + " >> (" + from_reg(tinfo, instr.Rtype.rs2) + " & (XLEN-1));");
+				}
+				else if (instr.Itype.is_rori()) {
+					// ROR: Rotate right
+					add_code(code,
+					"{const unsigned shift = " + from_reg(tinfo, instr.Rtype.rs2) + " & (XLEN-1);\n",
+						from_reg(instr.Rtype.rd) + " = (" + from_reg(tinfo, instr.Rtype.rs1) + " >> shift) | (" + from_reg(tinfo, instr.Rtype.rs1) + " << (XLEN - shift)); }"
+					);
+				}
 				break;
 			case 0x205: // SRA
 				add_code(code,
@@ -420,7 +464,35 @@ void CPU<W>::emit(std::string& code, const std::string& func, TransInstr<W>* ip,
 				add_code(code, from_reg(instr.Rtype.rd) + " = " + from_reg(instr.Rtype.rs2) + " + (" + from_reg(instr.Rtype.rs1) + " << 3);");
 				break;
 			case 0x204: // XNOR
-				add_code(code, from_reg(instr.Rtype.rd) + " = ~(" + from_reg(instr.Rtype.rs1) + " ^ " + from_reg(instr.Rtype.rs2) + " << 2);");
+				add_code(code, from_reg(instr.Rtype.rd) + " = ~(" + from_reg(instr.Rtype.rs1) + " ^ " + from_reg(instr.Rtype.rs2) + ");");
+				break;
+			case 0x206: // ORN
+				add_code(code, from_reg(instr.Rtype.rd) + " = (" + from_reg(instr.Rtype.rs1) + " | ~" + from_reg(instr.Rtype.rs2) + ");");
+				break;
+			case 0x207: // ANDN
+				add_code(code, from_reg(instr.Rtype.rd) + " = (" + from_reg(instr.Rtype.rs1) + " & ~" + from_reg(instr.Rtype.rs2) + ");");
+				break;
+			case 0x54: // MIN
+				add_code(code, from_reg(instr.Rtype.rd) + " = ((saddr_t)" + from_reg(instr.Rtype.rs1) + " < (saddr_t)" + from_reg(instr.Rtype.rs2) + ") "
+					" ? " + from_reg(instr.Rtype.rs1) + " : " + from_reg(instr.Rtype.rs2) + ";");
+				break;
+			case 0x55: // MINU
+				add_code(code, from_reg(instr.Rtype.rd) + " = (" + from_reg(instr.Rtype.rs1) + " < " + from_reg(instr.Rtype.rs2) + ") "
+					" ? " + from_reg(instr.Rtype.rs1) + " : " + from_reg(instr.Rtype.rs2) + ";");
+				break;
+			case 0x56: // MAX
+				add_code(code, from_reg(instr.Rtype.rd) + " = ((saddr_t)" + from_reg(instr.Rtype.rs1) + " > (saddr_t)" + from_reg(instr.Rtype.rs2) + ") "
+					" ? " + from_reg(instr.Rtype.rs1) + " : " + from_reg(instr.Rtype.rs2) + ";");
+				break;
+			case 0x57: // MAXU
+				add_code(code, from_reg(instr.Rtype.rd) + " = (" + from_reg(instr.Rtype.rs1) + " > " + from_reg(instr.Rtype.rs2) + ") "
+					" ? " + from_reg(instr.Rtype.rs1) + " : " + from_reg(instr.Rtype.rs2) + ";");
+				break;
+			case 0x301: // ROL
+				add_code(code,
+				"{const unsigned shift = " + from_reg(tinfo, instr.Rtype.rs2) + " & (XLEN-1);\n",
+					from_reg(instr.Rtype.rd) + " = (" + from_reg(tinfo, instr.Rtype.rs1) + " << shift) | (" + from_reg(tinfo, instr.Rtype.rs1) + " >> (XLEN - shift)); }"
+				);
 				break;
 			default:
 				ILLEGAL_AND_EXIT();
@@ -445,14 +517,21 @@ void CPU<W>::emit(std::string& code, const std::string& func, TransInstr<W>* ip,
 		case RV32I_SYSTEM:
 			if (instr.Itype.funct3 == 0x0) {
 				if (instr.Itype.imm == 0) {
-					code += "if (UNLIKELY(api.syscall(cpu, " + from_reg(17) + ", " + INSTRUCTION_COUNT(i) + ")))\n"
+					code += "cpu->pc = " + PCRELS(0) + "; "
+							"*cur_insn = c;\n";
+					code += "if (UNLIKELY(api.syscall(cpu, " + from_reg(17) + ")))\n"
 					       "  return;\n";
+					code += "local_max_insn = *max_insn;\n";
 					break;
 				} if (instr.Itype.imm == 1) {
-					code += "api.ebreak(cpu, " + INSTRUCTION_COUNT(i) + ");\nreturn;\n";
+					code += "cpu->pc = " + PCRELS(0) + "; "
+							"*cur_insn = c;\n";
+					code += "api.ebreak(cpu);\nreturn;\n";
 					break;
 				} if (instr.Itype.imm == 261) {
-					code += "api.stop(cpu, " + INSTRUCTION_COUNT(i) + ");\nreturn;\n";
+					code += "cpu->pc = " + PCRELS(0) + "; "
+							"*cur_insn = c;\n";
+					code += "api.stop(cpu);\nreturn;\n";
 					break;
 				} else {
 					code += "api.system(cpu, " + std::to_string(instr.whole) +");\n";
@@ -749,11 +828,11 @@ void CPU<W>::emit(std::string& code, const std::string& func, TransInstr<W>* ip,
 			} // fpfunc
 			} else ILLEGAL_AND_EXIT();
 			} break; // RV32F_FPFUNC
-			case RV32A_ATOMIC: // General handler for atomics
-				[[fallthrough]];
-			case RV32V_OP:	   // General handler for vector instructions
-				code += "api.execute(cpu, " + std::to_string(instr.whole) + ");\n";
-				break;
+		case RV32A_ATOMIC: // General handler for atomics
+			[[fallthrough]];
+		case RV32V_OP:	   // General handler for vector instructions
+			code += "api.execute(cpu, " + std::to_string(instr.whole) + ");\n";
+			break;
 		default:
 			//throw MachineException(ILLEGAL_OPCODE, "Unhandled instruction in code emitter", instr.opcode());
 			ILLEGAL_AND_EXIT();
@@ -761,7 +840,9 @@ void CPU<W>::emit(std::string& code, const std::string& func, TransInstr<W>* ip,
 	}
 	// If the function ends with an unimplemented instruction,
 	// we must gracefully finish, setting new PC and incrementing IC
-	code += "api.finish(cpu, " + std::to_string(tinfo.len-1) + ", " + INSTRUCTION_COUNT(tinfo.len-1) + ");\n}\n";
+	code += "cpu->pc += " + std::to_string((tinfo.len-1) * 4) + ";\n"
+			"*cur_insn = c + " + std::to_string(tinfo.len-1) + ";\n"
+			"}\n";
 }
 
 template void CPU<4>::emit(std::string&, const std::string&, TransInstr<4>*, const TransInfo<4>&) const;

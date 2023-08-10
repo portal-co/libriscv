@@ -54,25 +54,26 @@ typedef struct {
 } CPU;
 
 static struct CallbackTable {
-	uint8_t  (*mem_ld8)(CPU*, addr_t);
-	uint16_t (*mem_ld16)(CPU*, addr_t);
-	uint32_t (*mem_ld32)(CPU*, addr_t);
-	uint64_t (*mem_ld64)(CPU*, addr_t);
-	void (*mem_st8) (CPU*, addr_t, uint8_t);
-	void (*mem_st16)(CPU*, addr_t, uint16_t);
-	void (*mem_st32)(CPU*, addr_t, uint32_t);
-	void (*mem_st64)(CPU*, addr_t, uint64_t);
-	void (*jump)(CPU*, addr_t, uint64_t);
-	void (*finish)(CPU*, addr_t, uint64_t);
-	int  (*syscall)(CPU*, addr_t, uint64_t);
-	void (*stop)(CPU*, uint64_t);
-	void (*ebreak)(CPU*, uint64_t);
+	uint8_t  (*mem_ld8)(const CPU*, addr_t);
+	uint16_t (*mem_ld16)(const CPU*, addr_t);
+	uint32_t (*mem_ld32)(const CPU*, addr_t);
+	uint64_t (*mem_ld64)(const CPU*, addr_t);
+	void (*mem_st8) (const CPU*, addr_t, uint8_t);
+	void (*mem_st16)(const CPU*, addr_t, uint16_t);
+	void (*mem_st32)(const CPU*, addr_t, uint32_t);
+	void (*mem_st64)(const CPU*, addr_t, uint64_t);
+	void (*jump)(const CPU*, addr_t);
+	int  (*syscall)(CPU*, addr_t);
+	void (*stop)(CPU*);
+	void (*ebreak)(CPU*);
 	void (*system)(CPU*, uint32_t);
 	void (*execute)(CPU*, uint32_t);
 	void (*exception)(CPU*, int);
 	float  (*sqrtf32)(float);
 	double (*sqrtf64)(double);
 } api;
+static uint64_t* cur_insn;
+static uint64_t* max_insn;
 
 void* memcpy(void * restrict dst, const void * restrict src, unsigned len)
 {
@@ -107,8 +108,10 @@ static inline uint64_t MUL128(
 	return (middle << 32) | (uint32_t)p00;
 }
 
-extern void init(struct CallbackTable* table) {
+extern void init(struct CallbackTable* table, uint64_t* cur_icount, uint64_t* max_icount) {
 	api = *table;
+	cur_insn = cur_icount;
+	max_insn = max_icount;
 };
 )123";
 }

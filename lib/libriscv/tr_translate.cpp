@@ -6,6 +6,7 @@
 #include "instruction_list.hpp"
 #include "rv32i_instr.hpp"
 #include "tr_api.hpp"
+#include "tr_types.hpp"
 #include "util/crc32.hpp"
 #include <unordered_set>
 //#define BINTR_TIMING
@@ -334,12 +335,15 @@ void CPU<W>::activate_dylib(void* dylib) const
 	// map the API callback table
 	auto* ptr = dlsym(dylib, "init");
 	if (ptr == nullptr) {
-		fprintf(stderr, "libriscv: Could not find dylib init function\n");
+		// only warn when translation is not already disabled
+		if (getenv("NO_TRANSLATE") == nullptr) {
+			fprintf(stderr, "libriscv: Could not find dylib init function\n");
+		}
 		dlclose(dylib);
 		return;
 	}
 
-	auto func = (void (*)(const CallbackTable<W>&)) ptr;
+	auto func = (void (*)(const CallbackTable<W>&, uint64_t*, uint64_t*)) ptr;
 	func(CallbackTable<W>{
 		.mem_read8 = [] (CPU<W>& cpu, address_type<W> addr) -> uint8_t {
 			return cpu.machine().memory.template read<uint8_t> (addr);
@@ -365,35 +369,24 @@ void CPU<W>::activate_dylib(void* dylib) const
 		.mem_write64 = [] (CPU<W>& cpu, address_type<W> addr, uint64_t val) {
 			cpu.machine().memory.template write<uint64_t> (addr, val);
 		},
-		.jump = [] (CPU<W>& cpu, address_type<W> addr, uint64_t val) {
+		.jump = [] (CPU<W>& cpu, address_type<W> addr) {
 			cpu.jump(addr);
-			cpu.machine().increment_counter(val);
 		},
-		.finish = [] (CPU<W>& cpu, address_type<W> off, uint64_t val) {
-			cpu.increment_pc(off * 4);
-			cpu.machine().increment_counter(val);
-		},
-		.syscall = [] (CPU<W>& cpu, address_type<W> n, uint64_t val) -> int {
+		.syscall = [] (CPU<W>& cpu, address_type<W> n) -> int {
 			auto old_pc = cpu.pc();
-			cpu.registers().pc += val * 4;
 			cpu.machine().system_call(n);
 			// if the system did not modify PC, return to bintr
-			if (cpu.pc() - val * 4 == old_pc && !cpu.machine().stopped()) {
+			if (cpu.pc() == old_pc && !cpu.machine().stopped()) {
 				cpu.registers().pc = old_pc;
 				return 0;
 			}
 			// otherwise, update instruction counter and exit
-			cpu.machine().increment_counter(val);
 			return 1;
 		},
-		.stop = [] (CPU<W>& cpu, uint64_t val) {
-			cpu.registers().pc += val * 4;
-			cpu.machine().increment_counter(val);
+		.stop = [] (CPU<W>& cpu) {
 			cpu.machine().stop();
 		},
-		.ebreak = [] (CPU<W>& cpu, uint64_t val) {
-			cpu.registers().pc += val * 4;
-			cpu.machine().increment_counter(val);
+		.ebreak = [] (CPU<W>& cpu) {
 			cpu.machine().ebreak();
 		},
 		.system = [] (CPU<W>& cpu, uint32_t instr) {
@@ -412,7 +405,9 @@ void CPU<W>::activate_dylib(void* dylib) const
 		.sqrtf64 = [] (double d) -> double {
 			return std::sqrt(d);
 		},
-	});
+	},
+	&m_machine.get_counters().first,
+	&m_machine.get_counters().second);
 
 	// Map all the functions to instruction handlers
 	uint32_t* no_mappings = (uint32_t *)dlsym(dylib, "no_mappings");
